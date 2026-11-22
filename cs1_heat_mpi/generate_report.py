@@ -4,6 +4,7 @@
 import csv
 import pathlib
 import struct
+import statistics
 import zlib
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -75,7 +76,7 @@ FONT = {
 }
 
 
-def make_chart(strong_rows, path):
+def make_chart(strong_rows, path, x_label="MPI RANKS"):
     width, height = 760, 450
     pixels = bytearray([255] * (width * height * 3))
 
@@ -130,7 +131,7 @@ def make_chart(strong_rows, path):
     ]
     for rank, x in zip(ranks, x_positions):
         text(x - 2, y_bottom + 12, str(rank), scale=1)
-    text(310, 415, "MPI RANKS", scale=2)
+    text(310, 415, x_label, scale=2)
     text(292, 12, "SPEEDUP VS SERIAL", color=(30, 90, 150), scale=2)
 
     speedup_points = [
@@ -631,7 +632,6 @@ def build_report(rows):
         )
         cs2_n = int(next(row["N"] for row in cs2_raw if row["category"] == "serial"))
         first_case = cs2_row("private", 8, 1)
-        serial_k8 = cs2_row("baseline", 8, 1)
         graph_rows = [
             {
                 "ranks": row["threads"],
@@ -641,7 +641,7 @@ def build_report(rows):
             if row["category"] == "private" and row["k"] == 8
         ]
         graph_path_kmer = cs2_directory / "results" / "kmer_speedup.png"
-        make_chart(graph_rows, graph_path_kmer)
+        make_chart(graph_rows, graph_path_kmer, "OMP THREADS")
         extra_images.append((graph_path_kmer, "kmer_speedup.png", 760))
         paragraphs += [
             paragraph(page_break=True),
@@ -867,6 +867,238 @@ def build_report(rows):
             paragraph(
                 "[4] OpenMP Architecture Review Board, OpenMP API Specification, "
                 "Version 5.2, 2021."
+            ),
+        ]
+    cs3_directory = ROOT.parent / "cs3_monte_carlo"
+    cs3_summary_path = cs3_directory / "results" / "monte_carlo_summary.csv"
+    cs3_raw_path = cs3_directory / "results" / "monte_carlo_raw.csv"
+    if cs3_summary_path.exists() and cs3_raw_path.exists():
+        with cs3_summary_path.open(newline="") as stream:
+            mc_rows = list(csv.DictReader(stream))
+        with cs3_raw_path.open(newline="") as stream:
+            mc_raw = list(csv.DictReader(stream))
+
+        def mc_row(category, threads=None):
+            return next(row for row in mc_rows
+                        if row["category"] == category and
+                        (threads is None or int(row["threads"]) == threads))
+
+        for row in mc_rows:
+            for key in ("paths", "threads"):
+                row[key] = int(row[key])
+            for key in ("median_seconds", "speedup_vs_serial", "efficiency",
+                        "estimate", "standard_error", "throughput_mpaths_s",
+                        "serial_fraction_amdahl_vs_p1"):
+                if row[key] not in ("", None):
+                    row[key] = float(row[key])
+        for row in mc_raw:
+            for key in ("paths", "threads"):
+                row[key] = int(row[key])
+            for key in ("time", "estimate", "standard_error", "black_scholes"):
+                row[key] = float(row[key])
+
+        mc_parallel = sorted(
+            (row for row in mc_rows if row["category"] == "parallel"),
+            key=lambda row: row["threads"],
+        )
+        mc_baseline = mc_row("baseline")
+        mc_p1 = mc_row("parallel", 1)
+        mc_last = mc_parallel[-1]
+        mc_same = mc_row("same_seed")
+        bs_price = 10.450583572185565
+        mc_graph_rows = [
+            {"ranks": row["threads"], "speedup_vs_serial": row["speedup_vs_serial"]}
+            for row in mc_parallel
+        ]
+        mc_graph_path = cs3_directory / "results" / "monte_carlo_speedup.png"
+        make_chart(mc_graph_rows, mc_graph_path, "OMP THREADS")
+        extra_images.append((mc_graph_path, "monte_carlo_speedup.png", 760))
+        fixed_time_rows = []
+        for count in sorted({
+            int(row["threads"]) for row in mc_raw
+            if row["category"] == "fixed_time"
+        }):
+            samples = [
+                row for row in mc_raw
+                if row["category"] == "fixed_time" and int(row["threads"]) == count
+            ]
+            median_paths = statistics.median(int(row["paths"]) for row in samples)
+            median_se = statistics.median(float(row["standard_error"]) for row in samples)
+            median_time = statistics.median(float(row["time"]) for row in samples)
+            fixed_time_rows.append({
+                "threads": count, "paths": median_paths,
+                "standard_error": median_se, "time": median_time,
+                "throughput": median_paths / median_time / 1e6,
+            })
+        ft1 = next(row for row in fixed_time_rows if row["threads"] == 1)
+        ft8 = next(row for row in fixed_time_rows if row["threads"] == max(
+            row["threads"] for row in fixed_time_rows
+        ))
+        time_error_ratio = ft1["standard_error"] / ft8["standard_error"]
+        speedup_p1 = mc_p1["median_seconds"] / mc_last["median_seconds"]
+        amdahl_fraction = (
+            (1 / speedup_p1 - 1 / mc_last["threads"]) /
+            (1 - 1 / mc_last["threads"])
+        ) if mc_last["threads"] > 1 else 0.0
+        same_seed_unique_paths = int(mc_same["paths"]) // int(mc_same["threads"])
+        same_seed_expected_se_multiplier = int(mc_same["threads"]) ** 0.5
+        paragraphs += [
+            paragraph(page_break=True),
+            paragraph("Case Study 3: Monte Carlo Option Pricing", "Title"),
+            paragraph("European call under geometric Brownian motion | OpenMP", "Subtitle"),
+            paragraph(
+                "This study prices a European call with terminal stock "
+                "S_T=S_0 exp((r-sigma^2/2)T + sigma sqrt(T)Z), Z~N(0,1). "
+                "The estimate discounts the mean payoff max(S_T-K,0) by exp(-rT). "
+                "OpenMP was selected because paths are independent and the available "
+                "machine is shared-memory; thread-local RNG streams and Welford "
+                "statistics are combined without inter-thread path communication."
+            ),
+            table([
+                ["Parameter", "Value"],
+                ["S0", "100"],
+                ["Strike K", "100"],
+                ["Risk-free rate r", "0.05"],
+                ["Volatility sigma", "0.20"],
+                ["Maturity T", "1 year"],
+                ["Seed / paths", f"20261123 / {mc_baseline['paths']:,}"],
+                ["Black-Scholes price", f"{bs_price:.10f}"],
+            ], [3000, 6000]),
+            paragraph("Implementation, random streams, and reproducibility", "Heading1"),
+            paragraph(
+                "The serial baseline and parallel solver use the same -O3 C/OpenMP "
+                "build. Each worker's xoshiro256** state is initialized using "
+                "SplitMix64 from the master seed and a distinct worker seed. Paths "
+                "are assigned in contiguous fixed ranges and each thread accumulates "
+                "a Welford count, mean, and variance; partial statistics are merged "
+                "in thread-index order. This avoids shared rand() state and preserves "
+                "the same estimate and standard error for repeated runs with the "
+                "same seed and worker count. Results can differ slightly across "
+                "worker counts because the stream assignment and floating-point "
+                "merge order change."
+            ),
+            paragraph(
+                "Correctness tests reproduced the estimates and standard errors "
+                "exactly for repeated runs at 1, 2, 4, and 8 threads. A separate "
+                "500,000-path serial estimate was within six measured standard "
+                "errors of Black-Scholes. The fixed-work benchmark's final "
+                "estimates are compared against the analytic price in the table below."
+            ),
+            paragraph("Strong scaling and statistical accuracy", "Heading1"),
+            paragraph(
+                f"Fixed workload: M={mc_baseline['paths']:,} paths; three timed "
+                "runs per point. The machine is an Intel Core i7-8550U, four "
+                "physical cores/eight logical CPUs, with 7.7 GiB RAM. Process "
+                "settings were OMP_PROC_BIND=close and OMP_PLACES=cores. The "
+                "eight-thread point uses logical CPUs and is not an eight-physical-core claim."
+            ),
+        ]
+        mc_table = [[
+            "p", "Median time (s)", "S(p)", "E(p)", "Estimate",
+            "Abs diff", "SE", "M paths/s",
+        ]]
+        for row in mc_parallel:
+            mc_table.append([
+                str(row["threads"]), f"{row['median_seconds']:.4f}",
+                f"{row['speedup_vs_serial']:.3f}",
+                f"{100 * row['efficiency']:.1f}%",
+                f"{float(row['estimate']):.8f}",
+                f"{abs(float(row['estimate']) - bs_price):.2e}",
+                f"{float(row['standard_error']):.3e}",
+                f"{float(row['throughput_mpaths_s']):.2f}",
+            ])
+        paragraphs += [
+            table(mc_table, [450, 1300, 700, 850, 1500, 1100, 1300, 1100]),
+            image_paragraph("rId4", 760, 450, drawing_id=3),
+            paragraph(
+                "Figure 3. Fixed-work strong speedup against the serial baseline; "
+                "the dashed line is ideal linear speedup."
+            , italic=True),
+            paragraph(
+                f"The measured standard error at fixed time ({ft1['time']:.2f} s "
+                f"and {ft8['time']:.2f} s medians) was {ft1['standard_error']:.3e} "
+                f"at p=1 and {ft8['standard_error']:.3e} at p={ft8['threads']}. "
+                f"That is a {time_error_ratio:.2f}x error reduction for the same "
+                "elapsed-time budget, corresponding to approximately "
+                f"{time_error_ratio**2:.2f}x as many effective samples because "
+                "standard error scales as 1/sqrt(M). Fixed-time throughput was "
+                f"{ft1['throughput']:.2f} and {ft8['throughput']:.2f} million paths/s."
+            ),
+            paragraph("Why the RNG matters", "Heading1"),
+        ]
+        correlated_estimate = float(mc_same["estimate"])
+        correlated_se = float(mc_same["standard_error"])
+        paragraphs += [
+            table([
+                ["Stream setup", "Nominal paths", "Unique paths", "Reported SE", "Actual SE scale"],
+                ["Independent streams", f"{mc_same['paths']:,}",
+                 f"{mc_same['paths']:,}", f"{float(mc_last['standard_error']):.3e}",
+                 f"{float(mc_last['standard_error']):.3e}"],
+                ["Same seed per worker", f"{mc_same['paths']:,}",
+                 f"{same_seed_unique_paths:,}", f"{correlated_se:.3e}",
+                 f"~{correlated_se * same_seed_expected_se_multiplier:.3e}"],
+            ], [2100, 1500, 1500, 1500, 1800]),
+            paragraph(
+                f"In the intentionally flawed same-seed run at p={mc_same['threads']}, "
+                f"all workers repeated the same {same_seed_unique_paths:,}-path "
+                f"sequence. The nominal {mc_same['paths']:,} samples therefore "
+                "contained only one distinct stream. The observed mean was "
+                f"{correlated_estimate:.8f}, while the reported SE was "
+                f"{correlated_se:.3e}; treating the duplicated paths as independent "
+                f"understates the uncertainty by about sqrt(p)={same_seed_expected_se_multiplier:.2f}. "
+                "The test compares this reported error with a serial run of the "
+                "same number of unique paths. A single shared unsynchronized RNG "
+                "would additionally be a data race; adding a lock would serialize "
+                "generation. Neither approach is used by the correct solver."
+            ),
+            paragraph("Statistical and parallel efficiency", "Heading1"),
+            paragraph(
+                f"For fixed workload, the standard error is computed from the "
+                f"sample variance; the analytic price is {bs_price:.8f}. Each row "
+                "reports observed accuracy and throughput alongside conventional "
+                "speedup. At fixed time, the p=8 result reduces error by the factor "
+                "measured above. This is the useful statistical interpretation of "
+                "parallel speedup: more independent paths and lower uncertainty per "
+                "unit time, not merely a faster evaluation of one random path."
+            ),
+            paragraph("Amdahl's law and scaling limits", "Heading1"),
+            paragraph(
+                f"Using the parallel p=1 implementation as the Amdahl baseline, "
+                f"p={mc_last['threads']} had speedup {speedup_p1:.3f}; "
+                f"f=(1/S-1/p)/(1-1/p) estimates the serial fraction as "
+                f"{100 * amdahl_fraction:.2f}%. This estimate is noisy and can be "
+                "affected by turbo/thermal changes and run variability. Residual "
+                "losses include thread startup, deterministic partial-statistics "
+                "merge, RNG setup, transcendental instructions, cache/memory "
+                "effects, and hyper-threading contention. The fixed-work speedup "
+                "against the separately measured serial baseline is shown in the "
+                "table; the Amdahl estimate uses same-binary OpenMP p=1 timing."
+            ),
+            paragraph(
+                f"Although independent paths are theoretically embarrassingly "
+                f"parallel, this host measured only {mc_last['speedup_vs_serial']:.2f}x "
+                f"speedup at p={mc_last['threads']} (efficiency "
+                f"{100 * mc_last['efficiency']:.1f}%), so scaling was not close "
+                "to ideal in these runs. The measured result is reported rather "
+                "than assuming perfect scaling; the i7-8550U's four physical cores, "
+                "eight-thread hyper-threading, frequency behavior, and expensive "
+                "log/sqrt/cos/exp work limit throughput."
+            ),
+            paragraph(
+                "The price is reproducible for a fixed seed and worker count, but "
+                "not bitwise invariant across worker counts. Different stream "
+                "partitioning samples a different finite set of normal variates; "
+                "Welford merging also combines floating-point values in a different "
+                "grouping. These changes are expected and should remain within "
+                "statistical uncertainty."
+            ),
+            paragraph(
+                "[5] F. Black and M. Scholes, “The Pricing of Options and Corporate "
+                "Liabilities,” Journal of Political Economy, vol. 81, no. 3, 1973."
+            ),
+            paragraph(
+                "[6] G. Marsaglia and W. W. Tsang, “The Xorshift RNGs,” Journal of "
+                "Statistical Software, vol. 8, no. 14, 2003."
             ),
         ]
     body = "".join(paragraphs)
