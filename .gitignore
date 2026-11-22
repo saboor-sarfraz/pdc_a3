@@ -2,4 +2,7 @@
 cs1_heat_mpi/heat_serial
 cs1_heat_mpi/heat_mpi
 cs1_heat_mpi/*.bin
+cs2_kmer_openmp/kmer
+cs2_kmer_openmp/*.bin
 cs1_heat_mpi/__pycache__/
+cs2_kmer_openmp/__pycache__/

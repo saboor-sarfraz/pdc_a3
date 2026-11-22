@@ -232,13 +232,13 @@ def table(rows, widths=None):
     return xml + "</w:tbl>"
 
 
-def image_paragraph(relationship_id, width_px, height_px):
+def image_paragraph(relationship_id, width_px, height_px, drawing_id=1):
     width = int(6.6 * EMU_PER_INCH)
     height = int(width * height_px / width_px)
     return f"""
     <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>
     <wp:inline distT="0" distB="0" distL="0" distR="0">
-    <wp:extent cx="{width}" cy="{height}"/><wp:docPr id="1" name="Strong scaling"/>
+    <wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{drawing_id}" name="Strong scaling"/>
     <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
     <pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="strong_scaling.png"/>
     <pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{relationship_id}"/>
@@ -249,7 +249,8 @@ def image_paragraph(relationship_id, width_px, height_px):
     """
 
 
-def docx_package(body, image_path, width_px=760, height_px=450):
+def docx_package(body, image_path, extra_images=None, width_px=760, height_px=450):
+    extra_images = extra_images or []
     document = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
     <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -289,11 +290,19 @@ def docx_package(body, image_path, width_px=760, height_px=450):
     <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
     </Relationships>"""
-    document_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/strong_scaling.png"/>
-    </Relationships>"""
+    relation_rows = [
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/strong_scaling.png"/>',
+    ]
+    for index, (_, media_name, _) in enumerate(extra_images, 3):
+        relation_rows.append(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{media_name}"/>'
+        )
+    document_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(relation_rows) + "</Relationships>"
+    )
     with ZipFile(OUTPUT, "w", ZIP_DEFLATED) as package:
         package.writestr("[Content_Types].xml", types)
         package.writestr("_rels/.rels", root_rels)
@@ -301,6 +310,8 @@ def docx_package(body, image_path, width_px=760, height_px=450):
         package.writestr("word/styles.xml", styles)
         package.writestr("word/_rels/document.xml.rels", document_rels)
         package.write(image_path, "word/media/strong_scaling.png")
+        for extra_path, media_name, _ in extra_images:
+            package.write(extra_path, f"word/media/{media_name}")
 
 
 def fmt(value):
@@ -335,7 +346,7 @@ def build_report(rows):
         paragraph("Weather and heat diffusion simulation | editable interim report", "Subtitle"),
         paragraph(
             "This document contains the completed Case Study 1 section and shared "
-            "report framing. Case Studies 2–5 and the final cross-case comparison "
+            "report framing. Case Studies 3–5 and the final cross-case comparison "
             "will be appended after those studies are complete."
         ),
         paragraph("1. Introduction", "Heading1"),
@@ -585,8 +596,281 @@ def build_report(rows):
             "members must enter actual tasks, hours, and commit identifiers."
         , italic=True),
     ]
+    cs2_directory = ROOT.parent / "cs2_kmer_openmp"
+    cs2_summary_path = cs2_directory / "results" / "kmer_summary.csv"
+    cs2_raw_path = cs2_directory / "results" / "kmer_raw.csv"
+    extra_images = []
+    if cs2_summary_path.exists() and cs2_raw_path.exists():
+        with cs2_summary_path.open(newline="") as stream:
+            cs2_rows = list(csv.DictReader(stream))
+        with cs2_raw_path.open(newline="") as stream:
+            cs2_raw = list(csv.DictReader(stream))
+        for row in cs2_rows:
+            row["k"] = int(row["k"])
+            row["threads"] = int(row["threads"])
+            row["median_seconds"] = float(row["median_seconds"])
+            row["speedup_vs_serial"] = (
+                float(row["speedup_vs_serial"])
+                if row["speedup_vs_serial"] else 0.0
+            )
+            row["efficiency"] = float(row["efficiency"]) if row["efficiency"] else 0.0
+            row["throughput_mkmer_s"] = (
+                float(row["throughput_mkmer_s"])
+                if row["throughput_mkmer_s"] else 0.0
+            )
+            row["private_scratch_bytes"] = int(row["private_scratch_bytes"])
+
+        def cs2_row(category, k, threads):
+            return next(row for row in cs2_rows
+                        if row["category"] == category and row["k"] == k
+                        and row["threads"] == threads)
+
+        largest_threads = max(
+            row["threads"] for row in cs2_rows
+            if row["category"] in ("atomic", "private")
+        )
+        cs2_n = int(next(row["N"] for row in cs2_raw if row["category"] == "serial"))
+        first_case = cs2_row("private", 8, 1)
+        serial_k8 = cs2_row("baseline", 8, 1)
+        graph_rows = [
+            {
+                "ranks": row["threads"],
+                "speedup_vs_serial": row["speedup_vs_serial"],
+            }
+            for row in cs2_rows
+            if row["category"] == "private" and row["k"] == 8
+        ]
+        graph_path_kmer = cs2_directory / "results" / "kmer_speedup.png"
+        make_chart(graph_rows, graph_path_kmer)
+        extra_images.append((graph_path_kmer, "kmer_speedup.png", 760))
+        paragraphs += [
+            paragraph(page_break=True),
+            paragraph("Case Study 2: OpenMP k-mer Counting", "Title"),
+            paragraph("Parallel genomics histogram | measured on the same host", "Subtitle"),
+            paragraph(
+                f"The experiment counts all L-k+1 windows in a deterministically "
+                f"generated L={cs2_n:,} base sequence for k=8 and k=12. DNA bases "
+                "are two-bit encoded and the index rolls forward by two bits per "
+                "base. The default sequence uses a fixed seed and near-uniform base "
+                "frequencies. Timed work includes histogram zeroing, counting, and "
+                "private-histogram merging; sequence generation and scratch "
+                "allocation are excluded. The build used GCC 13.3 with "
+                "-O3 -std=c11 -fopenmp (GNU OpenMP 4.5)."
+            ),
+            paragraph("Implementation and correctness", "Heading1"),
+            paragraph(
+                "The serial reference counts each start position once. Version A "
+                "intentionally increments shared bins without synchronization; "
+                "concurrent read-modify-write operations can overwrite one another, "
+                "so counts are lost and C data-race behavior is undefined. Version B "
+                "uses an OpenMP atomic update. Version C gives each worker a "
+                "zeroed private histogram and merges all bins after counting."
+            ),
+            paragraph(
+                "Contiguous, non-overlapping start-index ranges are assigned to "
+                "threads. The DNA sequence itself is shared, so the owner of a "
+                "window start reads the following k-1 characters even if those "
+                "characters lie beyond its nominal start range. This counts every "
+                "boundary-spanning k-mer exactly once. Exact comparison of all "
+                "64-bit bins passed for k=8 and k=12, 1/2/4 threads, and lengths "
+                "97, 4099, and 100003. The latter lengths do not divide evenly by "
+                "the thread counts. The 100-million-base race demonstration is "
+                "recorded below and is not included in performance speedup."
+            ),
+            paragraph("Strong scaling", "Heading1"),
+            paragraph(
+                f"Fixed input: L={cs2_n:,} bases, OMP_NUM_THREADS in "
+                f"1, 2, 4; OMP_PROC_BIND=close; OMP_PLACES=cores. Each point is "
+                "the median of three runs. Speedup is against the same -O3 serial "
+                "baseline."
+            ),
+        ]
+        scaling_table = [["k", "Version", "p", "Median (s)", "S(p)", "E(p)", "M k-mers/s"]]
+        for k in (8, 12):
+            scaling_table.append([
+                str(k), "Serial", "1",
+                fmt(cs2_row("baseline", k, 1)["median_seconds"]), "1.000", "100.0%",
+                f"{cs2_row('baseline', k, 1)['throughput_mkmer_s']:.2f}",
+            ])
+            for category in ("atomic", "private"):
+                for threads in sorted({
+                    row["threads"] for row in cs2_rows
+                    if row["category"] == category and row["k"] == k
+                }):
+                    item = cs2_row(category, k, threads)
+                    scaling_table.append([
+                        str(k), category.capitalize(), str(threads),
+                        fmt(item["median_seconds"]), f"{item['speedup_vs_serial']:.3f}",
+                        f"{100 * item['efficiency']:.1f}%",
+                        f"{item['throughput_mkmer_s']:.2f}",
+                    ])
+        paragraphs.append(table(scaling_table, [550, 1200, 550, 1300, 1000, 1000, 1400]))
+        paragraphs += [
+            paragraph(
+                "The p=1 entries are actual one-thread OpenMP executions; they "
+                "are not substituted with the serial time. Small differences from "
+                "S(1)=1 arise from distinct implementation paths and timing "
+                "variation, and are retained rather than normalized away."
+            ),
+            image_paragraph("rId3", 760, 450, drawing_id=2),
+            paragraph(
+                "Figure 2. Version C (private histogram) strong speedup for k=8 "
+                "against the serial baseline; ideal linear speedup is shown for reference."
+            , italic=True),
+            paragraph("Atomic versus private histograms", "Heading1"),
+        ]
+        compare_table = [[
+            "k", "Bins (4^k)", "p", "Atomic (s)", "Private (s)",
+            "Private scratch", "Total private histogram memory",
+        ]]
+        for k in (8, 12):
+            atomic = cs2_row("atomic", k, largest_threads)
+            private = cs2_row("private", k, largest_threads)
+            bins = 4 ** k
+            result_hist_bytes = bins * 8
+            compare_table.append([
+                str(k), f"{bins:,}", str(largest_threads),
+                fmt(atomic["median_seconds"]), fmt(private["median_seconds"]),
+                f"{private['private_scratch_bytes'] / (1024 ** 2):.1f} MiB",
+                f"{(private['private_scratch_bytes'] + result_hist_bytes) / (1024 ** 2):.1f} MiB",
+            ])
+        atomic_k8 = cs2_row("atomic", 8, largest_threads)
+        private_k8 = cs2_row("private", 8, largest_threads)
+        atomic_k12 = cs2_row("atomic", 12, largest_threads)
+        private_k12 = cs2_row("private", 12, largest_threads)
+        winner_k8 = "private" if private_k8["median_seconds"] < atomic_k8["median_seconds"] else "atomic"
+        winner_k12 = "private" if private_k12["median_seconds"] < atomic_k12["median_seconds"] else "atomic"
+        paragraphs += [
+            table(compare_table, [500, 1400, 400, 1000, 1000, 1300, 2000]),
+            paragraph(
+                f"For k=8, the output histogram is {4**8 * 8 / 1024:.0f} KiB; "
+                f"for k=12 it is {4**12 * 8 / (1024**2):.0f} MiB. Version C "
+                f"allocates one additional output-sized histogram per thread: "
+                f"{first_case['private_scratch_bytes'] / 1024:.0f} KiB scratch "
+                f"for k=8 at one thread and "
+                f"{cs2_row('private', 12, 1)['private_scratch_bytes'] / (1024**2):.0f} MiB "
+                f"for k=12 at one thread. At p={largest_threads}, the private "
+                "scratch grows linearly with p, in addition to the merged result "
+                "histogram. The k=8 private table is relatively cache-friendly, "
+                "while each k=12 private table is far larger than the host's 8 MiB "
+                "last-level cache; clearing and merging those dense tables costs "
+                "time and memory bandwidth even when most bins are zero. Atomic "
+                "updates avoid per-thread dense tables but contend on popular bins "
+                "and can cause random cache-line traffic. The measured table, not "
+                "a universal rule, determines the crossover for this machine."
+            ),
+            paragraph(
+                f"At p={largest_threads}, {winner_k8} was faster for k=8 "
+                f"({min(atomic_k8['median_seconds'], private_k8['median_seconds']):.3f} s "
+                f"versus {max(atomic_k8['median_seconds'], private_k8['median_seconds']):.3f} s), "
+                f"while {winner_k12} was faster for k=12 "
+                f"({min(atomic_k12['median_seconds'], private_k12['median_seconds']):.3f} s "
+                f"versus {max(atomic_k12['median_seconds'], private_k12['median_seconds']):.3f} s). "
+                "The observed winner is specific to these measurements; dense "
+                "zeroing/merging and cache footprint change with k, while atomic "
+                "contention changes with both base distribution and thread count."
+            ),
+            paragraph("Race demonstration", "Heading1"),
+        ]
+        race_table = [["k", "Threads", "Expected windows", "Observed increments", "Lost increments"]]
+        for k in (8, 12):
+            race = next(row for row in cs2_raw
+                        if row["category"] == "race" and int(row["k"]) == k)
+            race_table.append([
+                str(k), race["threads"], f"{int(race['expected']):,}",
+                f"{int(race['total']):,}",
+                f"{int(race['expected']) - int(race['total']):,}",
+            ])
+        paragraphs += [
+            table(race_table, [700, 900, 2000, 2000, 1600]),
+            paragraph(
+                "The racy result is a single demonstration, not a stable benchmark "
+                "or a valid result. Its exact loss can vary by run, compiler, and "
+                "thread scheduling; even a run that happens to match is not proof "
+                "of correctness because unsynchronized concurrent updates are a data race."
+            ),
+            paragraph("False sharing", "Heading1"),
+        ]
+        false_sharing_rows = [[
+            "Threads", "Compact counters (s)", "Padded counters (s)",
+            "Padding time change", "Counter storage",
+        ]]
+        for count in sorted({
+            row["threads"] for row in cs2_rows
+            if row["category"] == "false_sharing_compact"
+        }):
+            compact = cs2_row("false_sharing_compact", 0, count)
+            padded = cs2_row("false_sharing_padded", 0, count)
+            change = 100 * (
+                1 - padded["median_seconds"] / compact["median_seconds"]
+            ) if compact["median_seconds"] else 0.0
+            false_sharing_rows.append([
+                str(count), fmt(compact["median_seconds"]),
+                fmt(padded["median_seconds"]), f"{change:+.1f}%",
+                f"{compact['private_scratch_bytes']} B vs "
+                f"{padded['private_scratch_bytes']} B",
+            ])
+        paragraphs += [
+            table(false_sharing_rows, [1000, 1800, 1800, 1600, 2200]),
+            paragraph(
+                "This microbenchmark gives each thread its own volatile counter "
+                "(so the counters do not race) and repeatedly updates it. Compact "
+                "8-byte counters can occupy the same 64-byte cache line; coherence "
+                "then moves the line between cores despite logically independent "
+                "counters. The padded representation aligns each counter to a "
+                "64-byte line. The measured change above is for this host and "
+                "iteration count; padding increases storage and may have no benefit "
+                "when only one thread runs."
+            ),
+            paragraph("Throughput and bottleneck discussion", "Heading1"),
+        ]
+        fastest = max(
+            (row for row in cs2_rows if row["category"] in ("atomic", "private")),
+            key=lambda row: row["throughput_mkmer_s"],
+        )
+        paragraphs += [
+            paragraph(
+                f"The fastest correct measured configuration processed "
+                f"{fastest['throughput_mkmer_s']:.2f} million k-mers/s "
+                f"(k={fastest['k']}, {fastest['category']}, "
+                f"p={fastest['threads']}). The rolling encoder reads each input "
+                "base approximately once across the sequence, about 1 byte per "
+                "k-mer asymptotically (plus O(k) initial reads per thread). Each "
+                "histogram update also logically reads 8 counter bytes and writes "
+                "8 counter bytes, for about 9 logical bytes read and 8 written "
+                "per k-mer before cache-line traffic. A cache miss may transfer a "
+                "full cache line. For k=8 the dense "
+                "histogram is small enough to benefit from cache reuse, although "
+                "atomic contention remains possible. For k=12, the 128 MiB "
+                "histogram exceeds the LLC, so random update traffic and the "
+                "private version's initialization/merge bandwidth dominate. "
+                "Scaling flattens when memory bandwidth, atomic/coherence traffic, "
+                "and dense merge work outweigh the additional worker compute."
+            ),
+            paragraph(
+                f"From p=2 to p=4, k=8 private throughput changed from "
+                f"{cs2_row('private', 8, 2)['throughput_mkmer_s']:.1f} to "
+                f"{cs2_row('private', 8, 4)['throughput_mkmer_s']:.1f} million "
+                f"k-mers/s ({cs2_row('private', 8, 4)['throughput_mkmer_s'] / cs2_row('private', 8, 2)['throughput_mkmer_s']:.2f}x, "
+                "below ideal 2x). For k=12 atomic, the corresponding measured "
+                f"gain is {cs2_row('atomic', 12, 4)['throughput_mkmer_s'] / cs2_row('atomic', 12, 2)['throughput_mkmer_s']:.2f}x. "
+                "These are the observed flattening points on this four-core host; "
+                "the 1-to-2 and 2-to-4 trends differ by k and synchronization strategy."
+            ),
+            paragraph(
+                "The sequence is generated before the timer, so the throughput "
+                "measures counting rather than random-number generation. Speedups "
+                "are limited to the four physical cores; the host exposes eight "
+                "logical CPUs, but no result here is presented as beyond-physical-core "
+                "speedup."
+            ),
+            paragraph(
+                "[4] OpenMP Architecture Review Board, OpenMP API Specification, "
+                "Version 5.2, 2021."
+            ),
+        ]
     body = "".join(paragraphs)
-    docx_package(body, graph_path)
+    docx_package(body, graph_path, extra_images)
 
 
 def main():
