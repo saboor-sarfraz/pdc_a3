@@ -1,0 +1,5 @@
+# Local build products
+cs1_heat_mpi/heat_serial
+cs1_heat_mpi/heat_mpi
+cs1_heat_mpi/*.bin
+cs1_heat_mpi/__pycache__/
