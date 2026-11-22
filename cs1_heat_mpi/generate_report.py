@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""Build an editable DOCX report and its scaling graph using Python stdlib only."""
+
+import csv
+import pathlib
+import struct
+import zlib
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
+
+
+ROOT = pathlib.Path(__file__).resolve().parent
+RESULTS = ROOT / "results"
+SUMMARY_PATH = RESULTS / "heat_summary.csv"
+OUTPUT = ROOT.parent / "Assignment3_Report.docx"
+EMU_PER_INCH = 914400
+
+
+def load_rows():
+    if not SUMMARY_PATH.exists():
+        raise SystemExit(
+            "Missing results/heat_summary.csv. Run benchmark.py with --full first."
+        )
+    with SUMMARY_PATH.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        for key in ("N", "steps", "ranks", "K"):
+            row[key] = int(row[key])
+        for key in (
+            "median_seconds", "serial_baseline_seconds", "speedup_vs_serial",
+            "efficiency", "median_comm_post_or_block_seconds",
+            "median_comm_wait_seconds", "median_interior_seconds",
+        ):
+            row[key] = float(row[key])
+    return rows
+
+
+FONT = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01110"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
+    "J": ("00111", "00010", "00010", "00010", "10010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "00110", "00110"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    " ": ("00000",) * 7,
+}
+
+
+def make_chart(strong_rows, path):
+    width, height = 760, 450
+    pixels = bytearray([255] * (width * height * 3))
+
+    def dot(x, y, color, size=1):
+        for dy in range(-size + 1, size):
+            for dx in range(-size + 1, size):
+                px, py = x + dx, y + dy
+                if 0 <= px < width and 0 <= py < height:
+                    offset = (py * width + px) * 3
+                    pixels[offset:offset + 3] = bytes(color)
+
+    def line(x0, y0, x1, y1, color, thickness=1):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        error = dx + dy
+        while True:
+            dot(x0, y0, color, thickness)
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = 2 * error
+            if doubled >= dy:
+                error += dy
+                x0 += sx
+            if doubled <= dx:
+                error += dx
+                y0 += sy
+
+    def text(x, y, value, color=(30, 30, 30), scale=2):
+        cursor = x
+        for char in value.upper():
+            bitmap = FONT.get(char, FONT[" "])
+            for row, bits in enumerate(bitmap):
+                for col, bit in enumerate(bits):
+                    if bit == "1":
+                        dot(cursor + col * scale, y + row * scale, color, scale)
+            cursor += 6 * scale
+
+    x_left, x_right, y_top, y_bottom = 84, 720, 42, 368
+    values = [row["speedup_vs_serial"] for row in strong_rows]
+    ranks = [row["ranks"] for row in strong_rows]
+    ymax = max(1.0, max(values), max(ranks)) * 1.15
+    for tick in range(6):
+        y = y_bottom - round((y_bottom - y_top) * tick / 5)
+        line(x_left, y, x_right, y, (225, 230, 235))
+        text(12, y - 6, f"{ymax * tick / 5:.1f}", scale=1)
+    line(x_left, y_top, x_left, y_bottom, (40, 50, 60), 2)
+    line(x_left, y_bottom, x_right, y_bottom, (40, 50, 60), 2)
+    x_positions = [
+        x_left + round((x_right - x_left) * (rank - min(ranks)) /
+                       max(1, max(ranks) - min(ranks)))
+        for rank in ranks
+    ]
+    for rank, x in zip(ranks, x_positions):
+        text(x - 2, y_bottom + 12, str(rank), scale=1)
+    text(310, 415, "MPI RANKS", scale=2)
+    text(292, 12, "SPEEDUP VS SERIAL", color=(30, 90, 150), scale=2)
+
+    speedup_points = [
+        (x, y_bottom - round(value / ymax * (y_bottom - y_top)))
+        for x, value in zip(x_positions, values)
+    ]
+    ideal_points = [
+        (x, y_bottom - round(rank / ymax * (y_bottom - y_top)))
+        for x, rank in zip(x_positions, ranks)
+    ]
+    for points, color in ((ideal_points, (150, 150, 150)),
+                          (speedup_points, (35, 105, 175))):
+        for first, second in zip(points, points[1:]):
+            line(*first, *second, color, 2)
+        for x, y in points:
+            dot(x, y, color, 4)
+    text(520, 390, "MEASURED", color=(35, 105, 175), scale=1)
+    text(640, 390, "IDEAL", color=(100, 100, 100), scale=1)
+    png = _png(width, height, pixels)
+    path.write_bytes(png)
+
+
+def _png(width, height, pixels):
+    def chunk(name, data):
+        return (
+            struct.pack(">I", len(data)) + name + data +
+            struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+        )
+
+    rows = bytearray()
+    stride = width * 3
+    for y in range(height):
+        rows.append(0)
+        rows.extend(pixels[y * stride:(y + 1) * stride])
+    return (
+        b"\x89PNG\r\n\x1a\n" +
+        chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+        chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+        chunk(b"IEND", b"")
+    )
+
+
+def xml_text(text):
+    return escape(str(text))
+
+
+def paragraph(text="", style=None, bold=False, italic=False, page_break=False):
+    if page_break:
+        return '<w:p><w:r><w:br w:type="page"/></w:r></w:p>'
+    style_tag = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+    if not text:
+        return f"<w:p>{style_tag}</w:p>"
+    props = ""
+    if bold or italic:
+        props = "<w:rPr>"
+        if bold:
+            props += "<w:b/>"
+        if italic:
+            props += "<w:i/>"
+        props += "</w:rPr>"
+    return (
+        f"<w:p>{style_tag}<w:r>{props}"
+        f'<w:t xml:space="preserve">{xml_text(text)}</w:t></w:r></w:p>'
+    )
+
+
+def table(rows, widths=None):
+    if not rows:
+        return ""
+    columns = len(rows[0])
+    if widths is None:
+        widths = [1800] * columns
+    xml = (
+        '<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/>'
+        '<w:tblW w:w="0" w:type="auto"/>'
+        '<w:tblBorders><w:top w:val="single" w:sz="4" w:color="AAB7C4"/>'
+        '<w:left w:val="single" w:sz="4" w:color="AAB7C4"/>'
+        '<w:bottom w:val="single" w:sz="4" w:color="AAB7C4"/>'
+        '<w:right w:val="single" w:sz="4" w:color="AAB7C4"/>'
+        '<w:insideH w:val="single" w:sz="4" w:color="D5DDE5"/>'
+        '<w:insideV w:val="single" w:sz="4" w:color="D5DDE5"/></w:tblBorders>'
+        '</w:tblPr><w:tblGrid>'
+    )
+    xml += "".join(f'<w:gridCol w:w="{width}"/>' for width in widths)
+    xml += "</w:tblGrid>"
+    for row_index, row in enumerate(rows):
+        xml += "<w:tr>"
+        for column, cell in enumerate(row):
+            shade = '<w:shd w:fill="DCE6F1"/>' if row_index == 0 else ""
+            bold = "<w:b/>" if row_index == 0 else ""
+            xml += (
+                f"<w:tc><w:tcPr>{shade}"
+                f'<w:tcW w:w="{widths[column]}" w:type="dxa"/>'
+                f"</w:tcPr><w:p><w:r><w:rPr>{bold}</w:rPr>"
+                f'<w:t xml:space="preserve">{xml_text(cell)}</w:t>'
+                "</w:r></w:p></w:tc>"
+            )
+        xml += "</w:tr>"
+    return xml + "</w:tbl>"
+
+
+def image_paragraph(relationship_id, width_px, height_px):
+    width = int(6.6 * EMU_PER_INCH)
+    height = int(width * height_px / width_px)
+    return f"""
+    <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>
+    <wp:inline distT="0" distB="0" distL="0" distR="0">
+    <wp:extent cx="{width}" cy="{height}"/><wp:docPr id="1" name="Strong scaling"/>
+    <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+    <pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="strong_scaling.png"/>
+    <pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{relationship_id}"/>
+    <a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+    <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>
+    </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+    """
+
+
+def docx_package(body, image_path, width_px=760, height_px=450):
+    document = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+      xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+      xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+      <w:body>{body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>
+      <w:pgMar w:top="1080" w:right="1080" w:bottom="1080" w:left="1080"/>
+      </w:sectPr></w:body></w:document>"""
+    styles = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+    <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="21"/></w:rPr>
+    <w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:style>
+    <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:b/><w:sz w:val="36"/>
+    <w:color w:val="17365D"/></w:rPr></w:style>
+    <w:style w:type="paragraph" w:styleId="Subtitle"><w:name w:val="Subtitle"/>
+    <w:rPr><w:sz w:val="24"/><w:color w:val="526579"/></w:rPr></w:style>
+    <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>
+    <w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+    <w:rPr><w:b/><w:sz w:val="28"/><w:color w:val="17365D"/></w:rPr></w:style>
+    <w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/>
+    <w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+    <w:rPr><w:b/><w:sz w:val="23"/><w:color w:val="365F91"/></w:rPr></w:style>
+    <w:style w:type="table" w:styleId="TableGrid"><w:name w:val="Table Grid"/></w:style>
+    </w:styles>"""
+    types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Default Extension="png" ContentType="image/png"/>
+    <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+    <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+    </Types>"""
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+    </Relationships>"""
+    document_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/strong_scaling.png"/>
+    </Relationships>"""
+    with ZipFile(OUTPUT, "w", ZIP_DEFLATED) as package:
+        package.writestr("[Content_Types].xml", types)
+        package.writestr("_rels/.rels", root_rels)
+        package.writestr("word/document.xml", document)
+        package.writestr("word/styles.xml", styles)
+        package.writestr("word/_rels/document.xml.rels", document_rels)
+        package.write(image_path, "word/media/strong_scaling.png")
+
+
+def fmt(value):
+    return f"{value:.4f}"
+
+
+def build_report(rows):
+    strong = sorted(
+        (row for row in rows if row["category"] == "strong"),
+        key=lambda row: row["ranks"],
+    )
+    weak = sorted(
+        (row for row in rows if row["category"] == "weak"),
+        key=lambda row: row["ranks"],
+    )
+    variants = [row for row in rows if row["category"] == "variant"]
+    convergence = [row for row in rows if row["category"] == "convergence"]
+    if not strong or not weak or not variants or not convergence:
+        raise SystemExit("Full results are needed; rerun benchmark.py with --full.")
+
+    def variant_time(ranks, layout, exchange):
+        return next(
+            row["median_seconds"] for row in variants
+            if row["ranks"] == ranks and row["layout"] == layout
+            and row["exchange"] == exchange
+        )
+
+    graph_path = RESULTS / "strong_scaling.png"
+    make_chart(strong, graph_path)
+    paragraphs = [
+        paragraph("Case Study 1: MPI Heat Diffusion", "Title"),
+        paragraph("Weather and heat diffusion simulation | editable interim report", "Subtitle"),
+        paragraph(
+            "This document contains the completed Case Study 1 section and shared "
+            "report framing. Case Studies 2–5 and the final cross-case comparison "
+            "will be appended after those studies are complete."
+        ),
+        paragraph("1. Introduction", "Heading1"),
+        paragraph(
+            "This study models heat diffusion over an N by N temperature grid. "
+            "Each time step uses a five-point stencil and two grids; the outer "
+            "boundary remains fixed. The update is u_next[i,j] = u[i,j] + alpha "
+            "* (north + south + west + east - 4*u[i,j]), with alpha = 0.2. "
+            "The implementation uses MPI only, as requested."
+        ),
+        paragraph("2. Machine and experimental method", "Heading1"),
+        table([
+            ["Property", "Recorded environment"],
+            ["CPU", "Intel Core i7-8550U @ 1.80 GHz"],
+            ["Physical / logical CPUs", "4 cores / 8 logical CPUs"],
+            ["Memory", "7.7 GiB reported by the OS"],
+            ["OS / compiler / MPI", "Ubuntu 24.04; GCC 13.3; Open MPI 4.1.6"],
+            ["Build flags", "-O3 -std=c11 for serial and MPI"],
+            ["Thread settings", "OMP_NUM_THREADS=1; OMP_PROC_BIND=close (MPI-only code)"],
+            ["Scaling processes", "1, 2, and 4 (capped at physical cores)"],
+        ], [2500, 6500]),
+        paragraph(
+            "Each MPI time is measured inside the program between MPI_Barrier calls; "
+            "the rank-zero result is the maximum elapsed time over ranks. Output "
+            "gathering and file I/O occur after the timed region. The serial baseline "
+            "uses the same optimization level. Every reported point is the median "
+            "of three independent runs. MPI was launched with "
+            "`mpirun --oversubscribe -np p`; rank placement used the Open MPI default."
+        ),
+        paragraph("3. Implementation and correctness", "Heading1"),
+        paragraph(
+            "The serial reference uses contiguous row-major arrays and swaps two "
+            "grids per step. The 1-D decomposition partitions rows; the 2-D "
+            "decomposition uses MPI_Dims_create and MPI_Cart_create. Both exchange "
+            "edge halos with either MPI_Sendrecv or nonblocking sends/receives. "
+            "The nonblocking path updates cells at least one cell away from a local "
+            "subdomain edge before waiting, then updates the edge cells. MPI_Allreduce "
+            "computes the global maximum absolute change every K steps."
+        ),
+        paragraph(
+            "Validation compares the complete row-major final grids against the "
+            "serial output with absolute tolerance 1e-12. For N=129 and T=40, the "
+            "checker passed all combinations of 1, 2, and 4 ranks, row and 2-D "
+            "decomposition, and blocking and nonblocking exchange. The observed "
+            "maximum absolute error was 0.000e+00."
+        ),
+        paragraph("4. Strong scaling", "Heading1"),
+        paragraph(
+            f"Fixed-size run: N={strong[0]['N']}, T={strong[0]['steps']}, "
+            "2-D blocks, nonblocking halos, K=50. Speedup is measured against "
+            "the serial executable, not MPI with one rank."
+        ),
+        table([["p", "MPI median (s)", "Serial baseline (s)", "S(p)", "E(p)"]]
+              + [[str(row["ranks"]), fmt(row["median_seconds"]),
+                  fmt(row["serial_baseline_seconds"]), fmt(row["speedup_vs_serial"]),
+                  f"{100 * row['efficiency']:.1f}%"] for row in strong],
+              [800, 1700, 1900, 1000, 1000]),
+        image_paragraph("rId2", 760, 450),
+        paragraph(
+            "Figure 1. Measured strong speedup and ideal linear speedup; x-axis "
+            "is MPI process count, y-axis is speedup against the serial baseline."
+        , italic=True),
+    ]
+    below = [row["ranks"] for row in strong
+             if row["ranks"] > 1 and row["efficiency"] < 0.70]
+    if below:
+        first_below = min(below)
+        threshold_text = (
+            f"Efficiency first falls below 70% at p={first_below} in the measured "
+            "curve. The model T_p ~= T_comp/p + T_comm attributes the loss to the "
+            "non-scaling overhead floor: halo latency, reductions, MPI-kernel "
+            "overhead, and memory-bandwidth contention as ranks share the host."
+        )
+    else:
+        threshold_text = (
+            "Efficiency does not fall below 70% at the measured process counts. "
+            "The measured curve therefore does not identify a below-70% threshold "
+            "on this machine. In T_p ~= T_comp/p + T_comm, the residual "
+            "T_comm ~= max(0, T_p - T_serial/p) estimates the communication and "
+            "synchronization floor; at higher p, halo and collective overhead will "
+            "eventually dominate."
+        )
+    last = max(strong, key=lambda row: row["ranks"])
+    residual = max(0.0, last["median_seconds"] -
+                   last["serial_baseline_seconds"] / last["ranks"])
+    paragraphs += [
+        paragraph(threshold_text),
+        paragraph(
+            f"At p={last['ranks']}, the simple-model residual estimate is "
+            f"T_comm ~= {residual:.4f} s (using the serial time as T_comp)."
+        ),
+        paragraph("5. Weak scaling", "Heading1"),
+        paragraph(
+            "For weak scaling, N(p)=round(N0*sqrt(p)) with N0 equal to the strong "
+            "scaling grid size, so the global cell count grows approximately "
+            "linearly with p and the cells assigned to each rank stay nearly "
+            "constant."
+        ),
+        table([["p", "N", "MPI median (s)", "Time / p=1"]]
+              + [[str(row["ranks"]), str(row["N"]), fmt(row["median_seconds"]),
+                  fmt(row["median_seconds"] / weak[0]["median_seconds"])]
+                 for row in weak],
+              [800, 1400, 2200, 2000]),
+        paragraph(
+                  "Ideal weak scaling keeps the elapsed time ratio near 1.0. Increases "
+                  "reflect added halo exchanges, synchronization, and MPI overhead. "
+            f"At p={weak[-1]['ranks']}, time is "
+            f"{weak[-1]['median_seconds'] / weak[0]['median_seconds']:.2f}x "
+            "the p=1 time, rather than flat. This is consistent with shared-host "
+            "memory-bandwidth/CPU contention and synchronization overhead; this "
+            "experiment does not isolate those contributors."
+        ),
+        paragraph("6. Surface-to-volume analysis", "Heading1"),
+        paragraph(
+            "For a balanced 1-D row split, each rank computes approximately N^2/p "
+            "owned cells and receives about 2N halo values per step (one neighboring "
+            "row from each side; edge ranks receive only N). Its receive-halo to "
+            "compute ratio is about 2p/N. For a balanced 2-D block, each rank owns "
+            "about N^2/p cells and receives about 2(N/sqrt(p))+2(N/sqrt(p)) = "
+            "4N/sqrt(p) halo values (fewer at physical edges); the ratio is about "
+            "4sqrt(p)/N. The 2-D ratio becomes smaller than the 1-D ratio for "
+            "p>4, reducing communication growth as rank count rises."
+        ),
+        table([["p", "1-D block (s)", "1-D nonblock (s)",
+                "2-D block (s)", "2-D nonblock (s)"]]
+              + [[str(row["ranks"]),
+                  fmt(variant_time(row["ranks"], "row", "blocking")),
+                  fmt(variant_time(row["ranks"], "row", "nonblocking")),
+                  fmt(variant_time(row["ranks"], "2d", "blocking")),
+                  fmt(variant_time(row["ranks"], "2d", "nonblocking"))]
+                 for row in sorted(strong, key=lambda item: item["ranks"])],
+              [800, 2000, 2000, 2000, 2000]),
+        paragraph(
+            "This implementation exchanges two halo layers total as one row on "
+            "each north/south side and one column on each east/west side, so its "
+            "sent-value count is the same order as the receive count. In the 1-D "
+            "layout, the column neighbors are MPI_PROC_NULL and only row halos "
+            "carry grid values."
+        ),
+        paragraph(
+            f"At p={strong[-1]['ranks']}, measured row-block and 2-D blocking "
+            f"times are {fmt(variant_time(strong[-1]['ranks'], 'row', 'blocking'))} "
+            f"and {fmt(variant_time(strong[-1]['ranks'], '2d', 'blocking'))} s. "
+            "The theoretical 2-D communication advantage begins beyond p=4; "
+            "this machine was intentionally limited to four physical cores, so "
+            "the asymptotic advantage is not directly tested. At p=4 the halo "
+            "counts are theoretically similar, consistent with the modest measured "
+            "difference; timings are also affected by local MPI and memory costs."
+        ),
+        paragraph("7. Blocking versus nonblocking and overlap", "Heading1"),
+    ]
+    max_ranks = max(row["ranks"] for row in strong)
+    block = next((row for row in variants if row["ranks"] == max_ranks
+                  and row["layout"] == "2d" and row["exchange"] == "blocking"), None)
+    nonblock = next((row for row in variants if row["ranks"] == max_ranks
+                     and row["layout"] == "2d" and row["exchange"] == "nonblocking"), None)
+    paragraphs.append(table([
+        ["2-D, p", "Exchange", "Total median (s)", "Halo/post or wait medians (s)", "Interior update (s)"],
+        [str(max_ranks), "Blocking", fmt(block["median_seconds"]),
+         fmt(block["median_comm_post_or_block_seconds"]), "n/a"],
+        [str(max_ranks), "Nonblocking", fmt(nonblock["median_seconds"]),
+         f"post {fmt(nonblock['median_comm_post_or_block_seconds'])}; "
+         f"wait {fmt(nonblock['median_comm_wait_seconds'])}",
+         fmt(nonblock["median_interior_seconds"])],
+    ], [1000, 1300, 1700, 2500, 1800]))
+    estimated_saved = max(
+        0.0,
+        block["median_comm_post_or_block_seconds"] -
+        nonblock["median_comm_post_or_block_seconds"] -
+        nonblock["median_comm_wait_seconds"],
+    )
+    estimate_pct = (
+        100 * estimated_saved / block["median_comm_post_or_block_seconds"]
+        if block["median_comm_post_or_block_seconds"] > 0 else 0.0
+    )
+    paragraphs += [
+        paragraph(
+            f"Using the blocking halo-exchange time as a reference, an approximate "
+            f"overlap estimate is max(0, blocking exchange - nonblocking post - "
+            f"nonblocking wait) = {estimated_saved:.6f} s, or {estimate_pct:.1f}% "
+            "of the blocking exchange time. This estimate is diagnostic rather "
+            "than an isolated network measurement: MPI_Wait time depends on MPI "
+            "progress, the local shared-memory transport, and message size. The "
+            "interior update is intentionally overlapped with the outstanding "
+            "requests; if the residual wait remains large, communication progress "
+            "or a small interior region limits useful overlap."
+        ),
+        paragraph(
+            f"End-to-end at p={max_ranks}, the nonblocking median is "
+            f"{100 * (nonblock['median_seconds'] / block['median_seconds'] - 1):+.1f}% "
+            "relative to blocking. Thus the measured overlap did not necessarily "
+            "translate into a faster full iteration."
+        ),
+        paragraph(
+            "The communication and interior sub-timers in this table are rank-zero "
+            "counters; only total elapsed time is reduced as a maximum over ranks. "
+            "Treat the overlap percentage as a local diagnostic, not a global "
+            "maximum-rank communication measurement."
+        ),
+        paragraph("8. Convergence reduction cost", "Heading1"),
+    ]
+    k1 = next(row for row in convergence
+              if row["ranks"] == max_ranks and row["K"] == 1)
+    k50 = next(row for row in convergence
+               if row["ranks"] == max_ranks and row["K"] == 50)
+    overhead_pct = 100 * (k1["median_seconds"] / k50["median_seconds"] - 1)
+    paragraphs += [
+        table([
+            ["p", "K", "Allreduces", "Median time (s)"],
+            [str(max_ranks), "1", str(k1["steps"]), fmt(k1["median_seconds"])],
+            [str(max_ranks), "50", str(k50["steps"] // 50), fmt(k50["median_seconds"])],
+        ], [1000, 1200, 2000, 3000]),
+        paragraph(
+            f"At p={max_ranks}, K=1 took {fmt(k1['median_seconds'])} s and K=50 "
+            f"took {fmt(k50['median_seconds'])} s ({overhead_pct:+.1f}% relative "
+            "to K=50). K=1 performs a global reduction after every step; K=50 "
+            "performs fewer collectives, reducing synchronization and latency cost. "
+            "The final convergence metric is the last scheduled check, so the "
+            "metric is reported only at that cadence."
+        ),
+        paragraph("9. Discussion and limitations", "Heading1"),
+        paragraph(
+            "The tested process counts are limited to the four physical cores; "
+            "the machine has eight logical CPUs, but this report does not claim "
+            "physical-core speedup beyond four ranks. Results are specific to this "
+            "single host and shared-memory MPI transport, so they should not be "
+            "generalized to a cluster interconnect. The supplied benchmark script "
+            "keeps raw repetitions and medians for reproducibility. The final "
+            "assignment report will add the remaining case studies, cross-case "
+            "comparison, and team contribution records."
+        ),
+        paragraph("References", "Heading1"),
+        paragraph(
+            "[1] Message Passing Interface Forum, MPI: A Message-Passing Interface "
+            "Standard, Version 4.1, 2023."
+        ),
+        paragraph(
+            "[2] Open MPI Project, Open MPI 4.1 documentation and implementation "
+            "used for the experiments."
+        ),
+        paragraph(
+            "[3] Linux machine information collected with lscpu and /proc/meminfo "
+            "on the benchmark host."
+        ),
+        paragraph(
+            "Contribution records: see the accompanying CONTRIBUTIONS.md; team "
+            "members must enter actual tasks, hours, and commit identifiers."
+        , italic=True),
+    ]
+    body = "".join(paragraphs)
+    docx_package(body, graph_path)
+
+
+def main():
+    RESULTS.mkdir(exist_ok=True)
+    rows = load_rows()
+    build_report(rows)
+    print(f"Created {OUTPUT}")
+    print(f"Created {RESULTS / 'strong_scaling.png'}")
+
+
+if __name__ == "__main__":
+    main()
